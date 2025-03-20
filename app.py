@@ -37,7 +37,7 @@ def load_models():
     return recognizer
 
 def analyze_audio(uploaded_file):
-    """Process audio file and return transcription and pitch"""
+    """Process audio file and return transcription, pitch details, and pause information"""
     temp_path = "temp_audio.wav"
     try:
         # Save uploaded file
@@ -47,17 +47,58 @@ def analyze_audio(uploaded_file):
         # Extract audio features using librosa
         y, sr_rate = librosa.load(temp_path)
         
-        # Calculate pitch using librosa
-        pitches, magnitudes = librosa.piptrack(y=y, sr=sr_rate)
-        pitch = np.mean(pitches[magnitudes > np.max(magnitudes) * 0.7])
+        # Detect silence/pauses
+        # Higher threshold means detecting only more prominent pauses
+        intervals = librosa.effects.split(y, top_db=30)
+        
+        # Calculate duration of pauses
+        pauses = []
+        for i in range(len(intervals)-1):
+            pause_duration = (intervals[i+1][0] - intervals[i][1]) / sr_rate
+            if pause_duration > 0.3:  # Only count pauses longer than 0.3 seconds
+                pauses.append(pause_duration)
 
-        # Perform transcription
+        # Perform transcription with timestamps
         recognizer = sr.Recognizer()
         with sr.AudioFile(temp_path) as source:
             audio_data = recognizer.record(source)
             transcription = recognizer.recognize_google(audio_data)
 
-        return transcription, pitch
+        # Split audio into segments based on pauses
+        segments = []
+        segment_pitches = []
+        
+        for i in range(len(intervals)):
+            start_sample, end_sample = intervals[i]
+            segment = y[start_sample:end_sample]
+            
+            # Calculate pitch for each segment
+            if len(segment) > 0:
+                pitches, magnitudes = librosa.piptrack(y=segment, sr=sr_rate)
+                segment_pitch = np.mean(pitches[magnitudes > np.max(magnitudes) * 0.7])
+                segment_pitches.append(segment_pitch)
+                
+                # Convert samples to time
+                start_time = float(start_sample) / sr_rate
+                end_time = float(end_sample) / sr_rate
+                segments.append({
+                    'start_time': start_time,
+                    'end_time': end_time,
+                    'pitch': segment_pitch
+                })
+
+        # Calculate average pitch for reference
+        avg_pitch = np.mean([s['pitch'] for s in segments])
+
+        speech_metrics = {
+            'segments': segments,
+            'pauses': pauses,
+            'average_pitch': avg_pitch,
+            'pause_count': len(pauses),
+            'average_pause_duration': np.mean(pauses) if pauses else 0
+        }
+
+        return transcription, speech_metrics
 
     except Exception as e:
         st.error(f"Error processing audio: {str(e)}")
@@ -67,32 +108,50 @@ def analyze_audio(uploaded_file):
         if os.path.exists(temp_path):
             os.remove(temp_path)
 
-def generate_feedback(transcription, pitch):
+def generate_feedback(transcription, speech_metrics):
     if not verify_groq_connection():
         return "Unable to generate feedback due to API connection issues. Please try again later."
 
-    prompt = f"""Analyze the following speech transcription and voice metrics for confidence, clarity, and fluency. 
+    # Create a detailed analysis of speaking patterns
+    pause_analysis = f"""
+    - Number of significant pauses: {speech_metrics['pause_count']}
+    - Average pause duration: {speech_metrics['average_pause_duration']:.2f} seconds
+    """
+
+    # Analyze pitch variations
+    pitch_variations = []
+    for i, segment in enumerate(speech_metrics['segments']):
+        variation = ((segment['pitch'] - speech_metrics['average_pitch']) / speech_metrics['average_pitch']) * 100
+        pitch_variations.append(variation)
+
+    prompt = f"""Analyze the following speech transcription and detailed voice metrics for confidence, clarity, and fluency. 
     Provide specific and concise suggestions for improvement.
     
     Speech Details:
     - Transcription: {transcription}
-    - Average Pitch: {pitch:.2f} Hz
+    - Average Pitch: {speech_metrics['average_pitch']:.2f} Hz
+    
+    Speaking Pattern Analysis:
+    {pause_analysis}
+    - Pitch variation between segments: Ranges from {min(pitch_variations):.1f}% to {max(pitch_variations):.1f}% from average
     
     Please provide feedback focusing on:
-    1. Voice quality and pitch modulation (considering the average pitch of {pitch:.2f} Hz)
-    2. Content clarity and structure
-    3. Overall delivery effectiveness
-    4. Specific areas for improvement
+    1. Voice quality and pitch modulation patterns
+    2. Effective use of pauses and pacing
+    3. Content clarity and structure
+    4. Overall delivery effectiveness
+    5. Specific areas for improvement
     
+    Consider how the speaker's use of pauses affects their message delivery and how pitch variations contribute to engagement.
     Provide the feedback in a structured, easy-to-read format."""
 
     try:
         completion = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",  # Updated model name
+            model="llama-3.3-70b-versatile",
             messages=[
                 {
                     "role": "system",
-                    "content": "You are a professional speech coach providing constructive feedback. Be specific, encouraging, and actionable in your recommendations."
+                    "content": "You are a professional speech coach providing constructive feedback. Be specific, encouraging, and actionable in your recommendations. Focus on both technical aspects (pitch, pauses) and content delivery."
                 },
                 {
                     "role": "user",
@@ -100,7 +159,7 @@ def generate_feedback(transcription, pitch):
                 }
             ],
             temperature=0.7,
-            max_tokens=400,
+            max_tokens=500,
             top_p=0.95,
             stream=False
         )
@@ -140,9 +199,9 @@ def main():
 
     if uploaded_file:
         with st.spinner("Processing your audio and generating feedback..."):
-            transcription, pitch = analyze_audio(uploaded_file)
+            transcription, speech_metrics = analyze_audio(uploaded_file)
             
-            if transcription and pitch:
+            if transcription and speech_metrics:
                 # Display Transcription
                 st.markdown('<div class="feedback-container">', unsafe_allow_html=True)
                 st.subheader("📝 Transcription")
@@ -150,22 +209,34 @@ def main():
                 st.markdown('</div>', unsafe_allow_html=True)
 
                 # Display Metrics
-                col1, col2 = st.columns(2)
+                col1, col2, col3 = st.columns(3)
                 with col1:
                     st.markdown('<div class="metric-container">', unsafe_allow_html=True)
-                    st.metric("🎵 Average Pitch", f"{pitch:.2f} Hz")
+                    st.metric("🎵 Average Pitch", f"{speech_metrics['average_pitch']:.2f} Hz")
                     st.markdown('</div>', unsafe_allow_html=True)
                 
                 with col2:
                     st.markdown('<div class="metric-container">', unsafe_allow_html=True)
+                    st.metric("⏱️ Pauses", f"{speech_metrics['pause_count']}")
+                    st.markdown('</div>', unsafe_allow_html=True)
+
+                with col3:
+                    st.markdown('<div class="metric-container">', unsafe_allow_html=True)
                     st.metric("📝 Word Count", str(len(transcription.split())))
                     st.markdown('</div>', unsafe_allow_html=True)
+
+                # Display Pitch Variation Graph
+                st.markdown('<div class="feedback-container">', unsafe_allow_html=True)
+                st.subheader("📊 Pitch Variation Analysis")
+                pitch_data = [segment['pitch'] for segment in speech_metrics['segments']]
+                st.line_chart(pitch_data)
+                st.markdown('</div>', unsafe_allow_html=True)
 
                 # Generate and Display AI Feedback
                 st.markdown('<div class="feedback-container">', unsafe_allow_html=True)
                 st.subheader("🤖 AI Speech Coach Feedback")
                 with st.spinner("Generating detailed feedback..."):
-                    feedback = generate_feedback(transcription, pitch)
+                    feedback = generate_feedback(transcription, speech_metrics)
                     st.markdown(feedback)
                 st.markdown('</div>', unsafe_allow_html=True)
             else:
