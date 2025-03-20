@@ -6,6 +6,8 @@ import os
 import warnings
 import requests
 from groq import Groq
+from pydub import AudioSegment
+import tempfile
 
 warnings.filterwarnings('ignore')
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
@@ -13,6 +15,33 @@ os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 # Initialize Groq client with API key from environment variable
 api_key = os.environ.get("GROQ_API_KEY", "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")
 groq_client = Groq(api_key=api_key)
+
+# Supported audio formats
+SUPPORTED_FORMATS = {
+    'wav': 'WAV',
+    'mp3': 'MP3',
+    'mp4': 'MP4',
+    'm4a': 'M4A',
+    'ogg': 'OGG',
+    'flac': 'FLAC'
+}
+
+def convert_to_wav(audio_file, file_type):
+    """Convert audio file to WAV format"""
+    try:
+        # Create a temporary file for the converted audio
+        temp_dir = tempfile.gettempdir()
+        temp_wav = os.path.join(temp_dir, "temp_audio.wav")
+        
+        # Load the audio file using pydub
+        audio = AudioSegment.from_file(audio_file, format=file_type.lower())
+        
+        # Export as WAV
+        audio.export(temp_wav, format="wav")
+        return temp_wav
+    except Exception as e:
+        st.error(f"Error converting audio file: {str(e)}")
+        return None
 
 # Verify Groq API connection
 def verify_groq_connection():
@@ -38,17 +67,33 @@ def load_models():
 
 def analyze_audio(uploaded_file):
     """Process audio file and return transcription, pitch details, and pause information"""
-    temp_path = "temp_audio.wav"
     try:
+        # Get file extension and convert to WAV if needed
+        file_extension = uploaded_file.name.split('.')[-1].lower()
+        if file_extension not in SUPPORTED_FORMATS:
+            st.error(f"Unsupported file format. Please upload one of: {', '.join(SUPPORTED_FORMATS.keys())}")
+            return None, None
+
+        # Create a temporary file for the uploaded audio
+        temp_dir = tempfile.gettempdir()
+        temp_input = os.path.join(temp_dir, f"input_audio.{file_extension}")
+        
         # Save uploaded file
-        with open(temp_path, 'wb') as f:
+        with open(temp_input, 'wb') as f:
             f.write(uploaded_file.getvalue())
 
+        # Convert to WAV if needed
+        if file_extension != 'wav':
+            temp_wav = convert_to_wav(temp_input, file_extension)
+            if not temp_wav:
+                return None, None
+        else:
+            temp_wav = temp_input
+
         # Extract audio features using librosa
-        y, sr_rate = librosa.load(temp_path)
+        y, sr_rate = librosa.load(temp_wav)
         
         # Detect silence/pauses
-        # Higher threshold means detecting only more prominent pauses
         intervals = librosa.effects.split(y, top_db=30)
         
         # Calculate duration of pauses
@@ -60,7 +105,7 @@ def analyze_audio(uploaded_file):
 
         # Perform transcription with timestamps
         recognizer = sr.Recognizer()
-        with sr.AudioFile(temp_path) as source:
+        with sr.AudioFile(temp_wav) as source:
             audio_data = recognizer.record(source)
             transcription = recognizer.recognize_google(audio_data)
 
@@ -105,8 +150,13 @@ def analyze_audio(uploaded_file):
         return None, None
     
     finally:
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
+        # Clean up temporary files
+        for temp_file in [temp_input, temp_wav]:
+            if os.path.exists(temp_file):
+                try:
+                    os.remove(temp_file)
+                except:
+                    pass
 
 def generate_feedback(transcription, speech_metrics):
     if not verify_groq_connection():
@@ -151,7 +201,7 @@ def generate_feedback(transcription, speech_metrics):
             messages=[
                 {
                     "role": "system",
-                    "content": "You are a professional speech coach providing constructive feedback. Be specific, encouraging, and actionable in your recommendations. Focus on both technical aspects (pitch, pauses) and content delivery."
+                    "content": "You are an experienced professional speech coach providing concise, structured, and actionable feedback. Your responses must be brief, specific, and supportive. Focus explicitly on the speaker's voice modulation, pitch consistency, use of pauses, content clarity, and overall delivery effectiveness. Provide clear recommendations for improvement, formatted into distinct bullet points, without unnecessary elaboration."
                 },
                 {
                     "role": "user",
@@ -195,7 +245,11 @@ def main():
 
     st.markdown('<h1 class="main-header">🎤 Speech Analysis & Feedback</h1>', unsafe_allow_html=True)
 
-    uploaded_file = st.file_uploader("Upload an audio file (WAV format)", type=['wav'])
+    # File uploader with supported formats
+    uploaded_file = st.file_uploader(
+        f"Upload an audio file (Supported formats: {', '.join(SUPPORTED_FORMATS.keys())})", 
+        type=list(SUPPORTED_FORMATS.keys())
+    )
 
     if uploaded_file:
         with st.spinner("Processing your audio and generating feedback..."):
